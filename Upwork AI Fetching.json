@@ -1,0 +1,493 @@
+{
+  "name": "Upwork AI Fetching - Hourly with Slack Approval",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "hour": 11
+            }
+          ]
+        }
+      },
+      "id": "5543bea3-cbe3-4a63-8477-c944763a4f91",
+      "name": "Hourly Job Fetch",
+      "type": "n8n-nodes-base.cron",
+      "position": [
+        -3488,
+        384
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.upwork.com/graphql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"query\": \"query marketplaceJobPostingsSearch($marketPlaceJobFilter: MarketplaceJobPostingsSearchFilter, $searchType: MarketplaceJobPostingSearchType, $sortAttributes: [MarketplaceJobPostingSearchSortAttribute]) { marketplaceJobPostingsSearch(marketPlaceJobFilter: $marketPlaceJobFilter, searchType: $searchType, sortAttributes: $sortAttributes) { totalCount edges { node { id title description category createdDateTime duration durationLabel engagement experienceLevel totalApplicants applied amount { rawValue } hourlyBudgetMin { rawValue } hourlyBudgetMax { rawValue } weeklyBudget { rawValue } skills { name prettyName highlighted } client { companyName location { country } totalFeedback totalPostedJobs totalHires verificationStatus totalReviews } job { contractTerms { contractType hourlyContractTerms { engagementType } } } } } pageInfo { hasNextPage endCursor } } }\",\n  \"variables\": {\n    \"marketPlaceJobFilter\": {\n      \"searchTerm_eq\": {\n        \"andTerms_all\": \"AWS\"\n      },\n      \"pagination_eq\": {\n        \"first\": 10,\n        \"after\": \"0\"\n      }\n    },\n    \"searchType\": \"USER_JOBS_SEARCH\",\n    \"sortAttributes\": [{\"field\": \"RECENCY\"}]\n  }\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "bf32dfd5-0663-4583-9f3d-bc39b69e449f",
+      "name": "Search AI Jobs (Fixed Query)",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        -3264,
+        384
+      ],
+      "typeVersion": 4,
+      "credentials": {
+        "oAuth2Api": {
+          "id": "YOUR_UPWORK_OAUTH_CREDENTIAL_ID",
+          "name": "Upwork"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const response = $input.first().json;\n\nif (response.errors) {\n  throw new Error('GraphQL Error: ' + JSON.stringify(response.errors));\n}\n\nconst jobs = response.data?.marketplaceJobPostingsSearch?.edges || [];\nconst totalCount = response.data?.marketplaceJobPostingsSearch?.totalCount || 0;\n\nconsole.log(`🔍 Processing ${jobs.length} of ${totalCount} total jobs...`);\n\nconst processedJobs = [];\n\nfor (let i = 0; i < jobs.length; i++) {\n  const job = jobs[i].node;\n  const client = job.client || {};\n  const rawJobId = job.id || 'N/A';\n  \n  // Add '02' prefix to job ID\n  const jobId = rawJobId !== 'N/A' ? '02' + rawJobId : 'N/A';\n  \n  // Generate job URL with '02' prefix\n  const jobUrl = rawJobId !== 'N/A' ? `https://www.upwork.com/jobs/~02${rawJobId}` : null;\n  \n  // Format posted date\n  let formattedDate = null;\n  if (job.createdDateTime) {\n    try {\n      formattedDate = new Date(job.createdDateTime).toISOString().split('T')[0];\n    } catch (e) {\n      formattedDate = null;\n    }\n  }\n  \n  // Process skills\n  const skills = job.skills ? job.skills.map(s => s.prettyName || s.name).join(', ') : '';\n  \n  // Calculate budget from Money type fields\n  let budget = 0;\n  let budgetType = 'Not specified';\n  \n  if (job.amount?.rawValue) {\n    // Fixed price job\n    budget = parseFloat(job.amount.rawValue);\n    budgetType = 'Fixed';\n  } else if (job.hourlyBudgetMin?.rawValue && job.hourlyBudgetMax?.rawValue) {\n    // Hourly rate job - calculate average\n    const min = parseFloat(job.hourlyBudgetMin.rawValue);\n    const max = parseFloat(job.hourlyBudgetMax.rawValue);\n    budget = (min + max) / 2;\n    budgetType = `Hourly: $${min}-$${max}`;\n  } else if (job.weeklyBudget?.rawValue) {\n    // Weekly budget\n    budget = parseFloat(job.weeklyBudget.rawValue);\n    budgetType = 'Weekly';\n  }\n  \n  // Get client location\n  const clientCountry = client.location?.country || 'Not specified';\n  \n  // Calculate client rating from feedback (0-5 scale)\n  const clientRating = client.totalFeedback ? parseFloat(client.totalFeedback) : 0;\n  \n  // Determine verification status\n  const clientVerification = client.verificationStatus || 'Not verified';\n  \n  // Determine priority based on client metrics\n  let priority = 'Low';\n  if (client.totalHires > 50 && clientRating > 4.5) {\n    priority = 'High';\n  } else if (client.totalHires > 10 && clientRating > 4.0) {\n    priority = 'Medium';\n  }\n  \n  // Calculate match score based on available data\n  let matchScore = 50; // Base score\n  if (skills.toLowerCase().includes('ai') || skills.toLowerCase().includes('machine learning')) {\n    matchScore += 20;\n  }\n  if (client.totalHires > 20) matchScore += 10;\n  if (clientRating > 4.5) matchScore += 10;\n  if (job.experienceLevel === 'EXPERT') matchScore += 10;\n  matchScore = Math.min(100, matchScore);\n  \n  // Get contract type from job data\n  const contractType = job.job?.contractTerms?.contractType || job.engagement || 'Not specified';\n  const engagementType = job.job?.contractTerms?.hourlyContractTerms?.engagementType || '';\n  \n  const jobData = {\n    // Job Details with '02' prefix\n    jobTitle: job.title || 'Untitled Job',\n    jobId: jobId,  // Now includes '02' prefix\n    jobUrl: jobUrl, // Now includes '02' prefix in URL\n    description: (job.description || '').substring(0, 1900),\n    skills: skills,\n    duration: job.durationLabel || job.duration || 'Not specified',\n    postedDate: formattedDate,\n    category: job.category || 'Not specified',\n    budget: budget,\n    budgetType: budgetType,\n    experienceLevel: job.experienceLevel || 'Not specified',\n    contractType: contractType,\n    engagementType: engagementType,\n    \n    // Proposals/Applications\n    proposals: job.totalApplicants || 0,\n    applied: job.applied || false,\n    \n    // Client/Company Information\n    company: client.companyName || 'Private Client',\n    clientCountry: clientCountry,\n    clientLocation: clientCountry, // Using country as location\n    clientRating: clientRating,\n    clientVerification: clientVerification,\n    totalPostedJobs: client.totalPostedJobs || 0,\n    totalHires: client.totalHires || 0,\n    totalReviews: client.totalReviews || 0,\n    \n    // Status and Scoring\n    status: 'New',\n    applicationStatus: job.applied ? 'Applied' : 'To Apply',\n    priority: priority,\n    matchScore: matchScore,\n    \n    // Company size based on total hires\n    companySize: client.totalHires ? `${client.totalHires} total hires` : 'Unknown',\n    \n    // Notes with all available insights\n    notes: `💼 ${client.companyName || 'Private'} | ⭐ Rating: ${clientRating.toFixed(1)}/5 | 🌍 ${clientCountry} | 👥 ${client.totalHires || 0} hires | 📝 ${client.totalPostedJobs || 0} jobs posted | 👤 ${job.totalApplicants || 0} applicants | 💰 ${budgetType} | 🎯 ${job.experienceLevel || 'Any'} level`\n  };\n  \n  processedJobs.push({ json: jobData });\n  console.log(`✅ Job ${i + 1}: ${job.title} - JobID: ${jobId}`);\n}\n\nconsole.log(`🎯 Successfully processed ${processedJobs.length} jobs with '02' prefix!`);\nreturn processedJobs;"
+      },
+      "id": "74b8694b-e55c-4e33-af6f-0b4c6f4bfe6e",
+      "name": "Process Jobs with 02 Prefix",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        -3040,
+        384
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/databases/YOUR_NOTION_DATABASE_ID/query",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_NOTION_API_TOKEN"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"filter\": {\n    \"property\": \"Job ID\",\n    \"rich_text\": {\n      \"is_not_empty\": true\n    }\n  },\n  \"page_size\": 100,\n  \"sorts\": [\n    {\n      \"property\": \"Posted Date\",\n      \"direction\": \"descending\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "be0b23ab-7a67-479f-b5df-3b78a2397ca3",
+      "name": "Query Existing Job IDs",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        -2816,
+        384
+      ],
+      "typeVersion": 4
+    },
+    {
+      "parameters": {
+        "functionCode": "// Get existing jobs from Notion query and new jobs from Upwork\nconst notionResponse = $('Query Existing Job IDs').first().json;\nconst newJobsFromUpwork = $('Process Jobs with 02 Prefix').all();\n\n// Extract existing Job IDs from Notion database\nconst existingJobIds = new Set();\nif (notionResponse && notionResponse.results) {\n  notionResponse.results.forEach(page => {\n    const jobIdProperty = page.properties['Job ID'];\n    if (jobIdProperty && jobIdProperty.rich_text && jobIdProperty.rich_text[0]) {\n      const jobId = jobIdProperty.rich_text[0].text.content;\n      if (jobId) {\n        existingJobIds.add(jobId.trim());\n      }\n    }\n  });\n}\n\nconsole.log(`🔍 Found ${existingJobIds.size} existing Job IDs in Notion database`);\nconsole.log(`📋 Processing ${newJobsFromUpwork.length} jobs from Upwork...`);\n\n// Filter out jobs that already exist\nconst newJobs = [];\nconst duplicateJobs = [];\nconst statistics = {\n  total: newJobsFromUpwork.length,\n  existing: 0,\n  newJobs: 0,\n  duplicates: 0\n};\n\nfor (let i = 0; i < newJobsFromUpwork.length; i++) {\n  const jobData = newJobsFromUpwork[i].json;\n  const jobId = jobData.jobId;\n  \n  if (existingJobIds.has(jobId)) {\n    // Job already exists in database\n    duplicateJobs.push({\n      json: {\n        ...jobData,\n        status: 'Duplicate',\n        isDuplicate: true,\n        reason: 'Job ID already exists in database'\n      }\n    });\n    statistics.existing++;\n    statistics.duplicates++;\n    console.log(`🔄 DUPLICATE: ${jobData.jobTitle} (ID: ${jobId})`);\n  } else {\n    // New job - add to processing queue\n    newJobs.push({\n      json: {\n        ...jobData,\n        status: 'New',\n        isDuplicate: false,\n        reason: 'New job not in database'\n      }\n    });\n    statistics.newJobs++;\n    console.log(`✅ NEW: ${jobData.jobTitle} (ID: ${jobId})`);\n  }\n}\n\n// Enhanced logging with detailed statistics\nconsole.log(`\\n📊 DUPLICATE DETECTION SUMMARY:`);\nconsole.log(`   Total jobs fetched: ${statistics.total}`);\nconsole.log(`   New jobs to process: ${statistics.newJobs}`);\nconsole.log(`   Duplicates filtered: ${statistics.duplicates}`);\nconsole.log(`   Database has: ${existingJobIds.size} existing jobs`);\n\nif (statistics.newJobs === 0) {\n  console.log(`\\n⚠️  No new jobs found! All ${statistics.total} jobs already exist in database.`);\n  console.log(`🔄 This is normal for hourly runs - indicates the system is working correctly.`);\n  // Return empty array to prevent unnecessary AI calls\n  return [];\n} else {\n  console.log(`\\n🎯 Processing ${statistics.newJobs} new jobs for AI proposal generation...`);\n}\n\n// Return only new jobs for further processing\nreturn newJobs;"
+      },
+      "id": "762780fe-45f4-4d92-af75-5e619b5a4175",
+      "name": "🔄 Filter New Jobs (Duplicate Detection)",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        -2592,
+        384
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "5ebca7c5-6f83-4d23-9473-5c27b51f0ce7",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              },
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "bd28c6b4-d6ff-4ab7-806f-2d43a9bb1d14",
+      "name": "🔍 Check Skip Processing",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        -2368,
+        384
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'gpt-5',\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a professional Upwork proposal writer specializing in AWS and DevOps projects. Always use the exact template provided in the user message for every proposal, adapting it to match specific job requirements while maintaining the core message and personality. Keep all proposals EXACTLY under 2000 characters.'\n    },\n    {\n      role: 'user',\n      content: `Generate a winning Upwork proposal using this EXACT template for the job:\n\nTEMPLATE TO USE:\nYou are Mehul Prajapati, an AWS DevOps Engineer with strong automation expertise and 7+ years of experience.\n\n== COMPLETE PROFILE ==\n- Name: Mehul Prajapati\n- Role: AWS DevOps Engineer (Primary) & Automation Specialist (Secondary)\n- Experience: 7+ years specializing in AWS cloud infrastructure, DevOps, and serverless architectures\n- Education: Bachelor's in Computer Engineering, GEC Rajkot (GPA: 7.1)\n- Certifications: AWS Certified Developer – Associate\n- Achievements: Top-Rated Freelancer on Upwork, Level Two Seller on Fiverr, 100% Job Success\n- Track Record: 100+ projects delivered, 80% led to long-term contracts\n- Team: Solo or with support from small EagerMinds team (AWS + full-stack devs)\n- Availability: Full-time freelancer, India (IST), flexible overlap with US/EU time zones\n- Rates: Typically \\$30–50/hr or milestone-based (negotiable)\n\n== CORE EXPERTISE (PRIORITIZED) ==\n\nPRIMARY FOCUS - AWS & DevOps (70% of work):\n- Deep AWS expertise: EC2, S3, RDS, Lambda, DynamoDB, API Gateway\n- Serverless architectures with 99.99% uptime achievement\n- AWS cost optimization (30% reduction track record, RI/SP planning, right-sizing)\n- Infrastructure as Code (Terraform, CloudFormation, CDK, SAM)\n- VPC design, IAM policies, KMS encryption, Secrets Manager\n- ECS Fargate & EKS container orchestration\n- CI/CD pipelines (GitHub Actions, GitLab, AWS CodePipeline, Jenkins)\n- Monitoring & Observability (CloudWatch, Grafana, Prometheus, alerts)\n- AWS Migration & Modernization (on-prem to cloud, lift-and-shift, re-architecting)\n- Disaster Recovery & High Availability architectures\n- AWS Security best practices & compliance (HIPAA, SOC2)\n\nSECONDARY FOCUS - Automation & AI Integration (25% of work):\n- Workflow automation with n8n, Zapier, AWS Step Functions\n- API integrations and serverless event-driven architectures\n- AI tool integration (OpenAI API, AWS Bedrock) for automation\n- ChatOps and automated incident response\n- Infrastructure automation and self-healing systems\n\nTERTIARY - Full-Stack & ML Support (5% of work):\n- Python & Bash scripting for DevOps automation\n- Basic ML model deployment on AWS SageMaker\n- Microservices architecture on AWS\n- ETL pipelines (Lambda, Step Functions, SQS, Kinesis)\n- Database management (RDS, DynamoDB, Aurora)\n\n== PROVEN CASE STUDIES (AWS-FOCUSED) ==\n1. AWS Cost Optimization → Built automated RI/SP scanner; reduced Fortune 500 AWS bill by 28% (\\$45K/month savings)\n2. AWS Migration → Migrated 50+ on-prem servers to AWS ECS/RDS; zero downtime, 40% performance gain\n3. Serverless Architecture → Rebuilt monolith as Lambda microservices; reduced costs 60%, improved scaling\n4. AWS Security → Implemented multi-account AWS Organizations with SCPs, GuardDuty, and Security Hub\n5. Infrastructure Automation → Terraformed entire AWS infrastructure (200+ resources), GitOps deployment\n6. Disaster Recovery → Designed multi-region DR with RTO <15min using Route53, Aurora Global Database\n\n== HUMAN-LIKE WRITING RULES ==\n\n### DYNAMIC OPENING SELECTION (Pick ONE based on context):\n- If posted <1hr ago: \"Saw this [X] minutes ago - I can start right now...\"\n- If specific problem mentioned: \"Your [specific issue] is exactly what I fixed last week for a [industry] client...\"\n- If general position/need: \"I've been building [exactly what they need] for [specific time]...\"\n- If urgent/ASAP: \"I'm online now and can deliver first results today...\"\n- If interesting challenge: \"This caught my eye because [specific interesting aspect]...\"\n- If high budget job: \"I specialize in [their need] at enterprise scale...\"\n\n### VARY YOUR STRUCTURE:\n- Sometimes 2 short paragraphs, sometimes 3-4\n- Mix paragraph and bullet styles naturally\n- Vary length: 100-200 words (don't always max out)\n- Natural flow, not rigid sections\n- If using bullets, max 3 points and keep them short\n\n### SOUND HUMAN:\n- Use contractions: I'll, I've, can't, won't, I'd\n- Add subtle personality: \"This caught my eye\", \"Interesting challenge\", \"Perfect timing\"\n- Plain English over jargon\n- Write like you're talking to a colleague, not writing a spec\n- Occasionally start with a question: \"Looking for someone who's actually built this before?\"\n\n### ROTATE THESE ELEMENTS (don't use all every time):\nMetrics - Pick 1-2 relevant ones:\n- Cost reduction (28%, 30%, 40%)\n- Uptime (99.9%, 99.99%)\n- Time saved (10 hrs/week, 50% faster)\n- Projects delivered (100+, dozens, multiple)\n- Client relationships (6+ months, long-term, ongoing)\n\nExperience mentions:\n- Sometimes say \"7+ years\", sometimes skip it\n- Sometimes mention certifications, often don't\n- Vary between \"I've done this exact thing\" vs \"I specialize in this\"\n\nClosing CTAs (rotate between):\n- \"When would be good to chat?\"\n- \"I can share more details over a quick call\"\n- \"Let me know if you'd like to see examples\"\n- \"Happy to discuss your specific needs\"\n- Sometimes no explicit CTA, just end naturally\n- Specific time slots only when truly urgent\n\n== CRITICAL: NEVER DO THESE ==\n❌ NEVER use [Client], [Name], or any placeholder\n❌ NEVER start with \"You need X. That's what I do\"\n❌ NEVER use numbered lists like 1), 2), 3) for main structure\n❌ NEVER include full technical stack unless specifically asked\n❌ NEVER use section headers like \"Why me:\" or \"How I'll deliver:\"\n❌ NEVER offer \"free consultation\" in every proposal\n❌ NEVER use same opening/closing patterns\n❌ NEVER exceed 250 words\n❌ NEVER use more than 3 bullet points\n❌ NEVER sound like a technical specification\n\n== CONTEXT-AWARE ADAPTATIONS ==\n\nFor FIXES/DEBUGGING:\n- Jump straight to the solution\n- Mention you've seen this error before\n- Give immediate next step\n- Keep it short (100-150 words)\n\nFor NEW BUILDS:\n- Focus on timeline and process\n- Mention similar project briefly\n- Outline 2-3 phase approach\n- Medium length (150-200 words)\n\nFor LONG-TERM/ONGOING:\n- Emphasize reliability and communication\n- Mention current availability\n- Reference long client relationships\n- Fuller length (200-250 words)\n\nFor HIGH COMPETITION (20+ proposals):\n- Lead with unique differentiator\n- Be more direct and punchy\n- Stand out with specific insight about their problem\n- Shorter to ensure it's read (100-150 words)\n\nFor NEW CLIENTS (0 hires):\n- Build trust with specific examples\n- Offer something concrete (timeline, approach)\n- Be warmer and more educational\n- Medium length (150-200 words)\n\n== FINAL CHECKLIST ==\n✓ Does it sound like a human wrote it quickly?\n✓ Is the opening unique to this job?\n✓ Are you solving THEIR problem, not listing YOUR skills?\n✓ Did you avoid all the NEVER DO items?\n✓ Is it scannable and easy to read?\n✓ Would you respond to this if you were the client?\n\n== EXAMPLE PROPOSALS TO EMULATE (Pick style based on context) ==\n\n### For WordPress/Migration (Technical but accessible):\nHello - I have split multisites into standalone installs and migrated to separate VPS with minimal downtime. Just finished a similar migration last week - configured Lets Encrypt SSL, optimized PHP-FPM, integrated Cloudflare CDN, and set up automated backups. I can handle your migration smoothly with proper staging, rollback scripts, and tested restores to avoid any data loss. When would be good to discuss the specifics? -Mehul\n\n### For Emergency/Urgent (Direct and action-oriented):\nHi there - I am online now and can jump on your server issue immediately. I have handled similar outages for startups - usually its memory leaks, misconfigured limits, or runaway processes. I will diagnose, fix, and set up monitoring to prevent recurrence. Recently cut client cloud costs by 30% while fixing their performance issues. Ready to start right away if you need immediate help. -Mehul\n\n### For AWS/DevOps (Conversational expertise):\nI am the AWS guy teams call when infrastructure needs to just work. Been doing ECS to EKS migrations, Lambda optimizations, and RDS HA setups for 7 years. Everything in Terraform - zero drift, PR-based deployments. Just shipped a pipeline handling 1M requests/month with zero downtime. Happy to screenshare my staging setup if you want to see the approach. If you need secure, boring, and fast releases, lets chat about your specific needs. -Mehul\n\n### For AWS Migration/Optimization:\nYour AWS costs are out of control? I just saved a SaaS client \\$45K/month by implementing Reserved Instances, right-sizing EC2, and moving static assets to CloudFront. Also migrated their monolith to serverless - cut costs another 40%. I can audit your AWS setup for free and show you exactly where money is leaking. Most clients see 25-30% savings in the first month. When can we review your AWS bill together? -Mehul\n\n### For Long-term/Enterprise AWS (Trust-building):\nLooking for someone who actually knows AWS inside out? I have been architecting AWS infrastructures for 7+ years - from startups to Fortune 500s. Recent project: designed multi-region setup with Aurora Global Database, Route53 failover, and 15-minute RTO. Currently managing 200+ AWS resources via Terraform for three enterprise clients. I work with max 3 clients at once for dedicated focus. Happy to start with infrastructure audit to prove value. What is your biggest AWS challenge right now? -Mehul\n\n### For High Competition (Stand out quickly):\nSaw this has 20+ proposals already, so I will be quick: Fixed this exact Terraform state drift issue yesterday. It is usually backend config mismatch or concurrent applies. Takes about 2 hours to diagnose and fix properly. I can show you the fix on a screenshare today if that helps. -Mehul\n\n### For New Clients (Educational and warm):\nHi! First time hiring on Upwork? No worries, I will make it smooth. Your project needs someone who understands both the technical side and business impact. I have helped dozens of startups build their MVP and scale - most become long-term partners. Here is how we would start: (1) Quick 15-min call to understand your needs (2) I will provide a clear plan with milestones (3) We start small to build trust. What questions do you have about the process? -Mehul\n\n== ADDITIONAL CONTEXT ==\n\n### Snippets to Rotate (AWS-FOCUSED):\n- I specialize in AWS serverless using Lambda, DynamoDB, and API Gateway\n- Migrated 50+ production workloads to AWS with zero downtime\n- AWS Certified Developer with 7 years hands-on AWS experience\n- Reduced AWS bills by 30-40% for multiple Fortune 500 clients\n- Terraform/CloudFormation expert - infrastructure as code is non-negotiable\n- Built multi-region AWS architectures with <15min RTO\n- Managed \\$100K+/month AWS environments with full cost optimization\n- AWS Well-Architected Framework reviews and implementations\n\n### FAQ Responses (if relevant to include):\n- Availability: Full-time freelancer, flexible with timezones\n- Communication: Daily updates, Slack/Discord friendly\n- Code quality: Test-driven, documented, maintainable\n- Rates: Fair and transparent, happy to work within budgets\n\nJOB DETAILS:\nJob Title: ${$json.jobTitle}\nDescription: ${$json.description}\nRequired Skills: ${$json.skills}\nBudget: ${$json.budgetType} - $${$json.budget}\nExperience Level: ${$json.experienceLevel}\nProposals: ${$json.proposals} (competition level)\nClient: ${$json.company} | Rating: ${$json.clientRating}/5 | ${$json.totalHires} hires | ${$json.clientCountry}\n\nSTRATEGY:\n- If <5 proposals and posted <1hr ago: Emphasize immediate availability\n- If high budget ($5000+ or $50+/hr): Focus on expertise and ROI\n- If many proposals (20+): Differentiate with specific proof/portfolio\n- If new client (0 hires): Offer trust-builders like free consultation\n- If urgent/ASAP mentioned: Lead with speed of delivery\n\nREQUIREMENTS:\n- Use the template above as foundation for EVERY job\n- Adapt template to match this specific job requirements\n- Keep proposal EXACTLY under 2000 characters\n- Do NOT include subject line or greeting prefixes\n- Start directly with proposal content\n- Maintain professional tone and personality from template\n\nGenerate the proposal now.`\n    }\n  ],\n  temperature: 1,\n  max_completion_tokens: 400\n}) }}",
+        "options": {}
+      },
+      "id": "6afaf12c-b149-41e7-8da4-40d4ac35c766",
+      "name": "Generate AI Proposal (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        -2144,
+        288
+      ],
+      "typeVersion": 4,
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "YOUR_OPENAI_BEARER_CREDENTIAL_ID",
+          "name": "Bearer Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Get the AI responses and the original job data\nconst aiResponses = $input.all();\nconst filterNode = $('🔄 Filter New Jobs (Duplicate Detection)');\nconst jobDataItems = filterNode.all();\n\nconst combinedItems = [];\n\nconsole.log(`Processing ${aiResponses.length} AI responses with ${jobDataItems.length} jobs...`);\n\n// Process each item - match AI response with corresponding job data by index\nfor (let i = 0; i < aiResponses.length; i++) {\n  const aiItem = aiResponses[i];\n  const jobItem = jobDataItems[i];\n  \n  // Get the original job data from the Filter Jobs node\n  const jobData = jobItem?.json || {};\n  \n  // Extract the proposal from the OpenAI response\n  let proposal = 'Proposal generation failed';\n  \n  // Check for OpenAI Chat Completion response structure\n  if (aiItem.json.choices && Array.isArray(aiItem.json.choices) && aiItem.json.choices[0]) {\n    if (aiItem.json.choices[0].message && aiItem.json.choices[0].message.content) {\n      proposal = aiItem.json.choices[0].message.content;\n    }\n  }\n  \n  // Combine the original job data with the proposal\n  const combinedData = {\n    // Copy all fields from the original job data\n    ...jobData,\n    // Add the AI-generated proposal\n    proposal: proposal,\n    proposalStatus: proposal !== 'Proposal generation failed' ? 'Generated' : 'Failed'\n  };\n  \n  combinedItems.push({ json: combinedData });\n  console.log(`✅ Combined job ${i + 1}: ${combinedData.jobTitle}`);\n}\n\nconsole.log(`\\n📝 Successfully processed ${combinedItems.length} jobs with proposals`);\nreturn combinedItems;"
+      },
+      "id": "9ecb42ad-c1dd-4c1f-82b0-7efd40006284",
+      "name": "Combine Job Data with Proposal",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        -1920,
+        288
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "functionCode": "// Process ALL items from the previous node\nconst allJobs = $input.all();\nconsole.log(`📝 Preparing ${allJobs.length} jobs for Notion...`);\n\nconst notionItems = [];\n\nfor (let i = 0; i < allJobs.length; i++) {\n  const jobData = allJobs[i].json;\n  \n  // Map all job data to Notion database fields\n  const notionPayload = {\n    parent: {\n      database_id: \"YOUR_NOTION_DATABASE_ID\"\n    },\n    properties: {\n      // Title field (required)\n      \"Job Title\": {\n        title: [\n          {\n            text: {\n              content: String(jobData.jobTitle || 'Untitled Job').substring(0, 2000)\n            }\n          }\n        ]\n      },\n      \n      // Job Details\n      \"Job ID\": {\n        rich_text: [\n          {\n            text: {\n              content: String(jobData.jobId || '')\n            }\n          }\n        ]\n      },\n      \"Description\": {\n        rich_text: [\n          {\n            text: {\n              content: String((jobData.description || '').substring(0, 2000))\n            }\n          }\n        ]\n      },\n      \"Skills\": {\n        rich_text: [\n          {\n            text: {\n              content: String(jobData.skills || '')\n            }\n          }\n        ]\n      },\n      \"Job URL\": {\n        url: jobData.jobUrl || null\n      },\n      \"Category\": {\n        rich_text: [\n          {\n            text: {\n              content: String(jobData.category || '')\n            }\n          }\n        ]\n      },\n      // AI-Generated Proposal\n      \"Proposal\": {\n        rich_text: [\n          {\n            text: {\n              content: String(jobData.proposal || 'No proposal generated').substring(0, 2000)\n            }\n          }\n        ]\n      },\n      \n      // Status fields - Set Approval Status to Pending for new jobs\n      \"Status\": {\n        select: {\n          name: jobData.status || 'New'\n        }\n      },\n      \"Application Status\": {\n        select: {\n          name: jobData.applicationStatus || 'To Apply'\n        }\n      },\n      \"Approval Status\": {\n        select: {\n          name: 'Pending'\n        }\n      },\n      \"Priority\": {\n        select: {\n          name: jobData.priority || 'Medium'\n        }\n      }\n    }\n  };\n  \n  // Add numeric and other fields\n  if (typeof jobData.budget === 'number' && !isNaN(jobData.budget) && jobData.budget > 0) {\n    notionPayload.properties[\"Budget\"] = { number: jobData.budget };\n  }\n  if (typeof jobData.clientRating === 'number' && !isNaN(jobData.clientRating) && jobData.clientRating > 0) {\n    notionPayload.properties[\"Client Rating\"] = { number: jobData.clientRating };\n  }\n  if (typeof jobData.matchScore === 'number' && !isNaN(jobData.matchScore) && jobData.matchScore > 0) {\n    notionPayload.properties[\"Match Score\"] = { number: jobData.matchScore };\n  }\n  \n  notionItems.push({ \n    json: {\n      notionPayload: notionPayload,\n      originalJobData: jobData\n    }\n  });\n}\n\nconsole.log(`📊 Total items prepared for Notion: ${notionItems.length}`);\nreturn notionItems;"
+      },
+      "id": "9bcbd932-e7b2-45c5-9f9a-4b2f660b3378",
+      "name": "Prepare Data for Notion",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        -1696,
+        288
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_NOTION_API_TOKEN"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.notionPayload) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1
+            }
+          },
+          "response": {
+            "response": {}
+          }
+        }
+      },
+      "id": "d306fbce-9a98-4117-a643-06c433fdba35",
+      "name": "Send to Notion",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        -1472,
+        288
+      ],
+      "typeVersion": 4
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract Notion page IDs and job data for Slack\nconst notionResponses = $input.all();\nconst preparedData = $('Prepare Data for Notion').all();\n\nconst processedJobs = [];\n\nfor (let i = 0; i < notionResponses.length; i++) {\n  const response = notionResponses[i].json;\n  const originalData = preparedData[i]?.json.originalJobData || {};\n  \n  if (response.id) {\n    processedJobs.push({\n      json: {\n        notionPageId: response.id,\n        notionUrl: response.url || `https://www.notion.so/${response.id.replace(/-/g, '')}`,\n        jobTitle: originalData.jobTitle,\n        jobUrl: originalData.jobUrl,\n        company: originalData.company,\n        budget: originalData.budget,\n        budgetType: originalData.budgetType,\n        description: originalData.description,\n        skills: originalData.skills,\n        proposal: originalData.proposal,\n        priority: originalData.priority,\n        matchScore: originalData.matchScore,\n        clientRating: originalData.clientRating,\n        totalHires: originalData.totalHires,\n        proposals: originalData.proposals,\n        experienceLevel: originalData.experienceLevel\n      }\n    });\n  }\n}\n\nconsole.log(`Extracted ${processedJobs.length} Notion page IDs for Slack notifications`);\nreturn processedJobs;"
+      },
+      "id": "7d40d284-fe36-4043-97cf-219b4e8d4618",
+      "name": "Extract Notion IDs",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        -1248,
+        288
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "functionCode": "// Process ALL jobs from the previous node\nconst allJobs = $input.all();\nconsole.log(`📨 Formatting Slack messages for ${allJobs.length} jobs...`);\n\nconst formattedMessages = [];\n\nfor (let i = 0; i < allJobs.length; i++) {\n  const job = allJobs[i].json;\n  \n  // Use the complete proposal without truncation\n  const proposalText = job.proposal || 'No proposal generated';\n\n  const slackMessage = {\n    blocks: [\n      {\n        type: \"header\",\n        text: {\n          type: \"plain_text\",\n          text: `🆕 ${job.jobTitle.substring(0, 150)}`,\n          emoji: true\n        }\n      },\n      {\n        type: \"section\",\n        fields: [\n          {\n            type: \"mrkdwn\",\n            text: `*Company:*\\n${job.company}`\n          },\n          {\n            type: \"mrkdwn\",\n            text: `*Budget:*\\n${job.budgetType} - $${job.budget}`\n          },\n          {\n            type: \"mrkdwn\",\n            text: `*Experience:*\\n${job.experienceLevel}`\n          },\n          {\n            type: \"mrkdwn\",\n            text: `*Match Score:*\\n${job.matchScore}%`\n          },\n          {\n            type: \"mrkdwn\",\n            text: `*Client Rating:*\\n⭐ ${job.clientRating}/5`\n          },\n          {\n            type: \"mrkdwn\",\n            text: `*Total Hires:*\\n${job.totalHires}`\n          },\n          {\n            type: \"mrkdwn\",\n            text: `*Proposals:*\\n${job.proposals}`\n          },\n          {\n            type: \"mrkdwn\",\n            text: `*Priority:*\\n${job.priority}`\n          }\n        ]\n      },\n      {\n        type: \"section\",\n        text: {\n          type: \"mrkdwn\",\n          text: `*Skills Required:*\\n${job.skills || 'Not specified'}`\n        }\n      },\n      {\n        type: \"divider\"\n      },\n      {\n        type: \"section\",\n        text: {\n          type: \"mrkdwn\",\n          text: `*📝 Generated Proposal:*\\n\\`\\`\\`${proposalText}\\`\\`\\``\n        }\n      },\n      {\n        type: \"section\",\n        text: {\n          type: \"mrkdwn\",\n          text: `<${job.jobUrl}|View Job on Upwork> | <${job.notionUrl}|View in Notion>`\n        }\n      },\n      {\n        type: \"actions\",\n        elements: [\n          {\n            type: \"button\",\n            text: {\n              type: \"plain_text\",\n              text: \"✅ Approve\",\n              emoji: true\n            },\n            style: \"primary\",\n            action_id: \"approve_job\",\n            value: `approve:${job.notionPageId}`\n          },\n          {\n            type: \"button\",\n            text: {\n              type: \"plain_text\",\n              text: \"❌ Reject\",\n              emoji: true\n            },\n            style: \"danger\",\n            action_id: \"reject_job\",\n            value: `reject:${job.notionPageId}`\n          }\n        ]\n      }\n    ]\n  };\n\n  console.log(`✅ Formatted message ${i + 1}: ${job.jobTitle}`);\n  \n  // Add each formatted job to the results array\n  formattedMessages.push({\n    json: {\n      ...job,\n      slackMessage: slackMessage\n    }\n  });\n}\n\nconsole.log(`🚀 Successfully formatted ${formattedMessages.length} Slack messages`);\nreturn formattedMessages;"
+      },
+      "id": "81473ce0-5fb8-45a1-8e41-ec7b4343c0ae",
+      "name": "Format Slack Message",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        -1024,
+        288
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "functionCode": "const results = $input.all();\nconst jobCount = results.length;\n\nconst report = {\n  status: '✅ WORKFLOW COMPLETE!',\n  message: `Successfully processed ${jobCount} new AI jobs!`,\n  timestamp: new Date().toISOString(),\n  features: [\n    '⏰ HOURLY SCHEDULE - Runs every hour automatically',\n    '🔄 DUPLICATE DETECTION - Filters existing jobs',\n    '🤖 AI PROPOSAL GENERATION - Personalized proposals',\n    '📝 NOTION DATABASE - All jobs saved',\n    '📢 SLACK NOTIFICATIONS - Sent with approve/reject buttons',\n    '🎉 APPROVAL WORKFLOW - Updates Notion on button click'\n  ],\n  nextSteps: [\n    '1. Check Slack for new job notifications',\n    '2. Click Approve or Reject on each job',\n    '3. Notion will update automatically',\n    '4. Apply to approved jobs on Upwork'\n  ],\n  note: '🎉 All done! Check Slack for job approvals!'\n};\n\nconsole.log('🎯 WORKFLOW SUCCESS:', report.message);\nreturn [{ json: report }];"
+      },
+      "id": "fcef3b7e-8d4e-4216-a660-d24d94eb663c",
+      "name": "✅ Success Report - Complete",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        -576,
+        288
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {},
+      "id": "7c4adf61-a14f-4f76-be3f-7d897e47f671",
+      "name": "📊 No New Jobs",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        -2144,
+        480
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "{\n  \"Authorization\": \"Bearer YOUR_SLACK_BOT_TOKEN\",\n  \"Content-Type\": \"application/json; charset=utf-8\"\n}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  channel: \"YOUR_SLACK_CHANNEL_ID\",\n  blocks: $json.slackMessage.blocks,\n  text: $json.slackMessage.blocks[0].text.text\n}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -800,
+        288
+      ],
+      "id": "33186e4a-9de4-4881-86f7-4387edef5245",
+      "name": "Slack - postMessage"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Send to Notion": {
+      "main": [
+        [
+          {
+            "node": "Extract Notion IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hourly Job Fetch": {
+      "main": [
+        [
+          {
+            "node": "Search AI Jobs (Fixed Query)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Notion IDs": {
+      "main": [
+        [
+          {
+            "node": "Format Slack Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Existing Job IDs": {
+      "main": [
+        [
+          {
+            "node": "🔄 Filter New Jobs (Duplicate Detection)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Slack Message": {
+      "main": [
+        [
+          {
+            "node": "Slack - postMessage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Data for Notion": {
+      "main": [
+        [
+          {
+            "node": "Send to Notion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔍 Check Skip Processing": {
+      "main": [
+        [
+          {
+            "node": "Generate AI Proposal (HTTP)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📊 No New Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate AI Proposal (HTTP)": {
+      "main": [
+        [
+          {
+            "node": "Combine Job Data with Proposal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Jobs with 02 Prefix": {
+      "main": [
+        [
+          {
+            "node": "Query Existing Job IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search AI Jobs (Fixed Query)": {
+      "main": [
+        [
+          {
+            "node": "Process Jobs with 02 Prefix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Job Data with Proposal": {
+      "main": [
+        [
+          {
+            "node": "Prepare Data for Notion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔄 Filter New Jobs (Duplicate Detection)": {
+      "main": [
+        [
+          {
+            "node": "🔍 Check Skip Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - postMessage": {
+      "main": [
+        [
+          {
+            "node": "✅ Success Report - Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "f7e1a8d3-3683-478d-8055-bbbdbce8de82",
+  "meta": {
+    "instanceId": "2c0417c90030c5bff595ef6b2d1d4a39e2a499756ecb5fc89feea64a8f89344a"
+  },
+  "id": "8yyNqRUWQpPysRUc",
+  "tags": []
+}

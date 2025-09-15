@@ -1,0 +1,240 @@
+{
+  "name": "Slack Approval Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "slack-approval",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "webhook-receiver",
+      "name": "Slack Interaction Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        304
+      ],
+      "webhookId": "YOUR_WEBHOOK_ID"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Slack sends payload as URL-encoded form data\n// Check what we actually received\nconsole.log('Raw webhook data:', JSON.stringify($json, null, 2));\nconsole.log('Body type:', typeof $json.body);\n\nlet payload;\n\n// Handle different possible formats\nif ($json.payload) {\n  // Direct payload field\n  payload = typeof $json.payload === 'string' ? JSON.parse($json.payload) : $json.payload;\n} else if ($json.body) {\n  // Check if body contains URL-encoded data\n  if (typeof $json.body === 'string') {\n    // Parse URL-encoded string: payload={\"....\"}\n    const urlParams = new URLSearchParams($json.body);\n    const payloadString = urlParams.get('payload');\n    \n    if (payloadString) {\n      payload = JSON.parse(payloadString);\n    } else {\n      throw new Error('No payload parameter found in URL-encoded body');\n    }\n  } else if ($json.body.payload) {\n    // Body is already parsed and contains payload\n    payload = typeof $json.body.payload === 'string' ? JSON.parse($json.body.payload) : $json.body.payload;\n  } else {\n    // Maybe the body IS the payload\n    payload = $json.body;\n  }\n} else {\n  // Log everything for debugging\n  console.log('Full received data:', JSON.stringify($json));\n  throw new Error('No payload found. Raw data logged above.');\n}\n\n// Log the parsed payload\nconsole.log('Parsed Slack payload:', JSON.stringify(payload, null, 2));\n\n// Extract relevant data\nconst action = payload.actions[0];\nconst [actionType, notionPageId] = action.value.split(':');\n\nconst result = {\n  actionType: actionType,\n  notionPageId: notionPageId,\n  actionId: action.action_id,\n  userId: payload.user.id,\n  userName: payload.user.username || payload.user.name,\n  teamId: payload.team.id,\n  teamDomain: payload.team.domain,\n  channelId: payload.channel.id,\n  channelName: payload.channel.name,\n  messageTs: payload.message.ts,\n  responseUrl: payload.response_url || null,\n  triggerTime: new Date().toISOString()\n};\n\nconsole.log(`🔔 Received ${actionType} action for Notion page: ${notionPageId}`);\nconsole.log(`👤 User: ${result.userName} (${result.userId})`);\nconsole.log(`📡 Response URL: ${result.responseUrl ? 'Found' : 'Missing'}`);\n\nreturn [{json: result}];"
+      },
+      "id": "parse-payload",
+      "name": "Parse Slack Payload",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        224,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.notion.com/v1/pages/{{$json.notionPageId}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_NOTION_API_TOKEN"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  properties: {\n    \"Approval Status\": {\n      select: {\n        name: $json.actionType === 'approve' ? 'Approved' : 'Rejected'\n      }\n    },\n    \"Application Status\": {\n      select: {\n        name: $json.actionType === 'approve' ? 'To Apply' : 'Skipped'\n      }\n    },\n    \"Approved By\": {\n      rich_text: [{\n        text: {\n          content: $json.userName + ' at ' + new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })\n        }\n      }]\n    }\n  }\n}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "update-notion",
+      "name": "Update Notion Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        448,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$json.responseUrl}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  replace_original: true,\n  text: $json.actionType === 'approve' ? \n    `✅ Job approved by ${$json.userName}` : \n    `❌ Job rejected by ${$json.userName}`,\n  blocks: [\n    {\n      type: \"section\",\n      text: {\n        type: \"mrkdwn\",\n        text: $json.actionType === 'approve' ? \n          `✅ *Job \"${$json.jobTitle}\" approved by ${$json.userName}*\\n\\nThe job has been marked as approved in Notion and is ready for application.` :\n          `❌ *Job \"${$json.jobTitle}\" rejected by ${$json.userName}*\\n\\nThe job has been marked as rejected in Notion.`\n      }\n    },\n    {\n      type: \"section\",\n      text: {\n        type: \"mrkdwn\",\n        text: $json.jobUrl ? `<${$json.jobUrl}|View Job on Upwork>` : 'Job URL not available'\n      }\n    },\n    {\n      type: \"context\",\n      elements: [{\n        type: \"mrkdwn\",\n        text: `Updated at ${new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })}`\n      }]\n    }\n  ]\n}) }}",
+        "options": {}
+      },
+      "id": "update-slack-msg",
+      "name": "Update Slack Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1120,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true }) }}",
+        "options": {}
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Slack",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1344,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Get the original data from Parse Payload node and Notion response\nconst originalData = $('Parse Slack Payload').first().json;\nconst notionResponse = $json;\n\n// Log what we have\nconsole.log('Original data from Parse Payload:', JSON.stringify(originalData, null, 2));\nconsole.log('Notion response:', JSON.stringify(notionResponse, null, 2));\n\n// Extract job URL from Notion response if available\nlet jobUrl = null;\nif (notionResponse && notionResponse.properties && notionResponse.properties['Job URL']) {\n  jobUrl = notionResponse.properties['Job URL'].url;\n}\n\n// Extract job title from Notion response if available\nlet jobTitle = 'Unknown Job';\nif (notionResponse && notionResponse.properties && notionResponse.properties['Job Title']) {\n  const titleProperty = notionResponse.properties['Job Title'];\n  if (titleProperty.title && titleProperty.title[0]) {\n    jobTitle = titleProperty.title[0].text.content;\n  }\n}\n\nconsole.log('Extracted job URL:', jobUrl);\nconsole.log('Extracted job title:', jobTitle);\n\n// Combine the data, preserving the original payload data (including responseUrl)\nconst combinedData = {\n  ...originalData,  // All original data including responseUrl\n  jobUrl: jobUrl,   // Job URL from Notion\n  jobTitle: jobTitle, // Job title from Notion\n  notionUpdated: true,\n  notionResponse: notionResponse\n};\n\nconsole.log('Combined data for Slack update:', JSON.stringify(combinedData, null, 2));\nconsole.log('Response URL available:', !!combinedData.responseUrl);\nconsole.log('Job URL available:', !!combinedData.jobUrl);\n\nreturn [{json: combinedData}];"
+      },
+      "id": "combine-data",
+      "name": "Combine Data for Slack",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        896,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.notion.com/v1/pages/{{ $('Parse Slack Payload').first().json.notionPageId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_NOTION_API_TOKEN"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-page-details",
+      "name": "Get Page Details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        672,
+        304
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Slack Interaction Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Slack Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Slack Payload": {
+      "main": [
+        [
+          {
+            "node": "Update Notion Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Notion Status": {
+      "main": [
+        [
+          {
+            "node": "Get Page Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Slack Message": {
+      "main": [
+        [
+          {
+            "node": "Respond to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Data for Slack": {
+      "main": [
+        [
+          {
+            "node": "Update Slack Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Page Details": {
+      "main": [
+        [
+          {
+            "node": "Combine Data for Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  },
+  "versionId": "bd3f5d56-768b-49a3-97c9-4cd7e42fa37a",
+  "meta": {
+    "instanceId": "2c0417c90030c5bff595ef6b2d1d4a39e2a499756ecb5fc89feea64a8f89344a"
+  },
+  "id": "IulKpz9os0vML6m8",
+  "tags": []
+}
